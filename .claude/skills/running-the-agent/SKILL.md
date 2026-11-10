@@ -1,48 +1,61 @@
 ---
 name: running-the-agent
 description: >-
-  How to run mini_agent locally, remotely, or in mixed mode, including Ollama,
-  env vars, MCP, interactive REPL, and provider fallback. Use when running
-  agent.py, adding a provider, debugging tool calling, or setting up .env.
+  How to run mini_agent on a Hailo-10H through hailo-ollama, including models,
+  env vars, tool-calling modes, MCP, interactive REPL, and model fallback. Use
+  when running agent.py, changing providers.py, debugging tool calling, or
+  setting up .env.
 ---
 
 # Running the agent
 
 ```bash
+# On the Pi: hailo-ollama (HailoRT 5.4.0+) on :8000. Dev box here: HAILO_OLLAMA_HOST=http://pi5-ai:8000
+hailo-ollama
+curl http://localhost:8000/hailo/v1/list
+curl http://localhost:8000/api/pull -H 'Content-Type: application/json' -d '{"model": "qwen3:1.7b", "stream": true}'
+
 source .venv/bin/activate
-cp .env.example .env   # add API keys first
-
-# Local (Ollama: ollama serve)
-python agent.py --mode local --local-model mistral-nemo "What is 15% of 847?"
-python agent.py --mode local "What is 15% of 847?"
-
-# Remote
-python agent.py --mode remote --provider openai "Explain ReAct agents"
-python agent.py --mode remote --provider anthropic --model claude-sonnet-4-6 "..."
-python agent.py --mode remote --provider gemini "..."
-
-# Mixed: local orchestrates, ask_remote() hits the cloud
-python agent.py --mode mixed "What's today's date and explain quantum entanglement"
-
-python agent.py --mode local --interactive
-python agent.py --mode remote --quiet "What is 144 * 37?"
+python agent.py "What is 15% of 847?"
+python agent.py --model qwen3:4b "..."            # 8 GB Hailo-10H only
+python agent.py --fallback qwen3:4b qwen2.5:1.5b "..."
+python agent.py --interactive
+python agent.py --quiet "What is 144 * 37?"
 ```
 
 ## File roles
 
 | File | Role |
 |---|---|
-| `agent.py` | CLI: argparse, REPL, mode dispatch |
-| `core.py` | `run_agent`, `run_agent_mixed` |
+| `agent.py` | CLI: argparse, REPL |
+| `core.py` | `run_agent` |
 | `reliability.py` | retry, circuit breaker, validation, tracing, fallback |
-| `providers.py` | OpenAI, Anthropic, Gemini, Ollama |
+| `providers.py` | `HailoOllamaProvider`, `create_provider(model)` |
 | `tools.py` | tools, schemas, `call_tool` |
 | `ui.py` | spinner |
 | `mcp_server.py` / `mcp_client.py` | MCP demo tools |
 
-Canonical messages list is OpenAI-style. Each provider converts internally. Mixed mode injects `ask_remote` into the local tool list.
+hailo-ollama is the only provider. It is called on `POST /api/chat` with stdlib `urllib`, `stream: false`. The canonical messages list is OpenAI-style; `_to_ollama_messages` converts it.
 
-Gemini uses the OpenAI SDK against `generativelanguage.googleapis.com/v1beta/openai/`.
+## Tool calling
+
+- `HAILO_TOOL_MODE=native` (default): sends Ollama's `tools` field. Verified on 5.4.0 + `qwen3:1.7b`: `tool_calls[].function.arguments` comes back as a dict. Tool results go back as `role: tool` with `tool_name`.
+- `HAILO_TOOL_MODE=prompt`: tools are described in the system prompt, the model replies `{"tool": ..., "arguments": {...}}`, and results go back as `TOOL RESULT (name): ...` user messages.
+- An HTTP 400 "does not support tools" in native mode switches to prompt mode automatically.
+- `<think>…</think>` blocks (qwen3) are stripped from content.
+
+## Env
+
+| Var | Default |
+|---|---|
+| `HAILO_OLLAMA_HOST` | `http://localhost:8000` (falls back to `OLLAMA_HOST`) |
+| `HAILO_TOOL_MODE` | `native` |
+
+No API keys.
+
+## Models
+
+Default `qwen3:1.7b` (about 15-30 s per agent turn on the Pi; reliable for one tool per task, may skip a second). `qwen3:4b` (5.5.0+) needs the 8 GB device. `qwen2.5:1.5b` and `qwen2:1.5b` are smaller fallbacks. `gemma4:e2b` has no tool support, so it runs in prompt mode. The server runs one model and one connection at a time.
 
 ## Adding tools
 
@@ -52,14 +65,6 @@ Gemini uses the OpenAI SDK against `generativelanguage.googleapis.com/v1beta/ope
 
 `web_search` and `get_weather` are stubs.
 
-## Keys
+## Tests
 
-| Key | Provider |
-|---|---|
-| `OPENAI_API_KEY` | OpenAI (Ollama ignores it) |
-| `ANTHROPIC_API_KEY` | Anthropic |
-| `GEMINI_API_KEY` | Gemini |
-
-Defaults: openai `gpt-4o-mini`, anthropic `claude-haiku-4-5-20251001`, gemini `gemini-2.0-flash`, ollama `qwen2.5`. Function calling works on `llama3.1`, `llama3.2`, `qwen2.5`, `mistral-nemo`. Skip `phi3` and `deepseek-r1` for tools.
-
-`--fallback MODEL [MODEL …]` tries models in order when structured tool calls fail.
+`python -m unittest test_hailo_provider test_tools` runs offline against a fake `/api/chat` server.

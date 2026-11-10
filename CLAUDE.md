@@ -1,6 +1,6 @@
 # Mini Agent
 
-Companion repo for the series Software Engineering in the Agentic AI Era. No agent framework: Python, the OpenAI SDK, and a `while` loop. Three modes: local (Ollama), remote (cloud), mixed.
+Companion repo for the series Software Engineering in the Agentic AI Era. No agent framework: Python, the standard library, and a `while` loop. This fork runs every LLM call on a Hailo-10H through hailo-ollama (`qwen3:1.7b` default).
 
 ## Always
 
@@ -10,7 +10,7 @@ Companion repo for the series Software Engineering in the Agentic AI Era. No age
 
 ## Skills
 
-- `running-the-agent`: venv, `.env`, local / remote / mixed, MCP, fallback
+- `running-the-agent`: venv, `.env`, hailo-ollama, tool modes, MCP, fallback
 - `visual-check`: `visual-testing/ui_agent.py` record and check
 - `deploy`: `deployment-pipeline/release.py` and `infra_tools.py`
 

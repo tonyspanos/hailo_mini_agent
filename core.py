@@ -1,8 +1,7 @@
 """
 The agent loop.
 
-run_agent()       — single provider, all tools run locally
-run_agent_mixed() — local Ollama orchestrates; routes complex tasks to a remote LLM
+run_agent() — the hailo-ollama model drives the loop; all tools run locally
 """
 
 from __future__ import annotations
@@ -15,39 +14,6 @@ _SYSTEM_DEFAULT = (
     "You are a helpful assistant. Use the available tools when needed. "
     "When you have a complete final answer, respond in plain text without calling any tools."
 )
-
-_SYSTEM_MIXED = (
-    "You are a local AI orchestrator running on the user's machine. "
-    "You have access to local tools: get_current_date, calculate, get_weather, web_search. "
-    "You also have ask_remote() to delegate tasks to a more capable cloud model. "
-    "Use local tools for simple lookups, calculations, and factual queries. "
-    "Use ask_remote() for tasks that need deep reasoning, creative writing, detailed "
-    "explanations, or broad world knowledge that you are not confident about. "
-    "Always assemble the final answer yourself."
-)
-
-_ASK_REMOTE_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "ask_remote",
-        "description": (
-            "Delegate a task to the more capable remote AI model. "
-            "Use this for complex reasoning, creative writing, detailed explanations, "
-            "or questions that require broad world knowledge."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "task": {
-                    "type": "string",
-                    "description": "The specific question or subtask to send to the remote model.",
-                }
-            },
-            "required": ["task"],
-        },
-    },
-}
-
 
 def _fmt_args(arguments: dict) -> str:
     s = ", ".join(f"{k}={v!r}" for k, v in arguments.items())
@@ -70,10 +36,8 @@ def run_agent(
     Sends the task to the provider, executes tool calls, feeds results back,
     and repeats until the model returns a plain-text final answer.
 
-    extra_functions: optional dict of {name: callable} for dynamically injected
-                     tools (e.g. ask_remote in mixed mode).
-    _spinner: caller-supplied Spinner; run_agent_mixed passes its own so that
-              ask_remote() can update the same spinner line.
+    extra_functions: optional dict of {name: callable} for dynamically injected tools.
+    _spinner: optional caller-supplied Spinner to share one status line.
     """
     if tools is None:
         tools = TOOL_SCHEMAS
@@ -126,39 +90,3 @@ def run_agent(
                 "tool_call_id": tc.id,
                 "content": str(result),
             })
-
-
-def run_agent_mixed(
-    task: str,
-    local_provider: LLMProvider,
-    remote_provider: LLMProvider,
-    verbose: bool = True,
-) -> str:
-    """
-    Mixed-mode agent loop.
-
-    The local Ollama model acts as orchestrator: it handles simple tool calls
-    itself and routes complex subtasks to the remote model via ask_remote().
-    """
-    spinner: Spinner | None = Spinner() if verbose else None
-
-    def ask_remote(task: str) -> str:
-        task_preview = (task[:60] + "…") if len(task) > 60 else task
-        if spinner:
-            spinner.update(f"→ remote ({remote_provider}): {task_preview}")
-        result = run_agent(task, remote_provider, verbose=False)
-        if spinner:
-            spinner.update("← remote: done")
-        return result
-
-    mixed_tools = TOOL_SCHEMAS + [_ASK_REMOTE_SCHEMA]
-
-    return run_agent(
-        task=task,
-        provider=local_provider,
-        tools=mixed_tools,
-        extra_functions={"ask_remote": ask_remote},
-        system_prompt=_SYSTEM_MIXED,
-        verbose=verbose,
-        _spinner=spinner,
-    )

@@ -2,24 +2,14 @@
 """
 Mini Agent — a minimal AI agent with no framework dependencies.
 
-Three modes:
-  local   — all LLM calls go to a local Ollama model
-  remote  — all LLM calls go to a cloud provider (OpenAI, Anthropic, or Gemini)
-  mixed   — local Ollama orchestrates; delegates complex tasks to the remote model
+Every LLM call goes to hailo-ollama on a Hailo-10H (Raspberry Pi AI HAT+ 2),
+default http://localhost:8000. Tools run locally.
 
 Usage examples:
-  python agent.py --mode local "What is 15% of 847?"
-  python agent.py --mode local --local-model qwen2.5 "What's the weather in Tokyo?"
-
-  python agent.py --mode remote --provider openai "Explain how ReAct agents work"
-  python agent.py --mode remote --provider anthropic --model claude-haiku-4-5-20251001 "Write a haiku about Python"
-  python agent.py --mode remote --provider gemini --model gemini-2.0-flash "Summarize MCP"
-
-  python agent.py --mode mixed "What's today's date and explain quantum entanglement"
-  python agent.py --mode mixed --local-model qwen2.5 --provider anthropic "..."
-
-  python agent.py --mode local --interactive
-  python agent.py --mode remote --interactive
+  python agent.py "What is 15% of 847?"
+  python agent.py --model qwen3:4b "What's the weather in Tokyo and today's date?"
+  python agent.py --fallback qwen3:4b qwen2.5:1.5b "What is 144 * 37?"
+  python agent.py --interactive
 """
 
 from __future__ import annotations
@@ -33,54 +23,30 @@ try:
 except ImportError:
     pass  # python-dotenv is optional; export env vars manually if not installed
 
-from providers import create_provider, LLMProvider
-from core import run_agent, run_agent_mixed
+from providers import DEFAULT_MODEL, create_provider, LLMProvider
 from reliability import run_agent_reliable, run_agent_with_fallback
 
 
 _BANNER = """\
 ╔══════════════════════════════════════════╗
 ║           Mini Agent  v0.1               ║
-║   local  |  remote  |  mixed             ║
+║        hailo-ollama  ·  Hailo-10H        ║
 ╚══════════════════════════════════════════╝"""
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="agent",
-        description="A minimal AI agent — no frameworks, just the loop.",
+        description="A minimal AI agent on a Hailo-10H. No frameworks, just the loop.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     p.add_argument(
-        "--mode",
-        choices=["local", "remote", "mixed"],
-        default="local",
-        help="Execution mode (default: local)",
-    )
-    p.add_argument(
-        "--local-model",
-        default="qwen2.5",
-        metavar="MODEL",
-        help="Ollama model for local/mixed mode (default: qwen2.5). "
-             "Any model that supports function calling works: qwen2.5, mistral-nemo, llama3.2, ...",
-    )
-    p.add_argument(
-        "--provider",
-        choices=["openai", "anthropic", "gemini"],
-        default="openai",
-        dest="remote_provider",
-        help="Cloud provider for remote/mixed mode (default: openai)",
-    )
-    p.add_argument(
         "--model",
-        default=None,
-        dest="remote_model",
+        default=DEFAULT_MODEL,
         metavar="MODEL",
-        help=(
-            "Cloud model name. Defaults: "
-            "openai→gpt-4o-mini, anthropic→claude-haiku-4-5-20251001, gemini→gemini-2.0-flash"
-        ),
+        help=f"hailo-ollama model (default: {DEFAULT_MODEL}). "
+             "qwen3:4b needs the 8 GB Hailo-10H. List models with GET /hailo/v1/list.",
     )
     p.add_argument(
         "--interactive", "-i",
@@ -97,10 +63,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=[],
         metavar="MODEL",
-        help=(
-            "Fallback local model(s) tried in order if the primary fails "
-            "(e.g. --fallback llama3.1 mistral-nemo). Local mode only."
-        ),
+        help="Fallback hailo-ollama model(s) tried in order if the primary fails "
+             "(e.g. --fallback qwen3:4b qwen2.5:1.5b).",
     )
     p.add_argument(
         "task",
@@ -110,24 +74,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _describe_mode(args, local: LLMProvider | None, remote: LLMProvider | None) -> str:
-    if args.mode == "local":
-        return f"local  →  {local}"
-    if args.mode == "remote":
-        return f"remote →  {remote}"
-    return f"mixed  →  local: {local}  |  remote: {remote}"
-
-
-def run_task(task: str, args, local: LLMProvider | None, remote: LLMProvider | None) -> str:
+def run_task(task: str, args, provider: LLMProvider) -> str:
     verbose = not args.quiet
-    if args.mode == "local":
-        if args.fallback:
-            providers = [local] + [create_provider("ollama", m) for m in args.fallback]
-            return run_agent_with_fallback(task, providers, verbose=verbose)
-        return run_agent_reliable(task, local, verbose=verbose)
-    if args.mode == "remote":
-        return run_agent_reliable(task, remote, verbose=verbose)
-    return run_agent_mixed(task, local, remote, verbose=verbose)
+    if args.fallback:
+        providers = [provider] + [create_provider(m) for m in args.fallback]
+        return run_agent_with_fallback(task, providers, verbose=verbose)
+    return run_agent_reliable(task, provider, verbose=verbose)
 
 
 def main() -> None:
@@ -136,42 +88,30 @@ def main() -> None:
 
     print(_BANNER)
 
-    # --- Build providers ---
-    local: LLMProvider | None = None
-    remote: LLMProvider | None = None
+    provider = create_provider(args.model)
+    print(f"\nModel: {provider}  @  {provider.host}  (tools: {provider.tool_mode})\n")
 
+    if args.interactive:
+        _repl(args, provider)
+        return
+
+    if not args.task:
+        parser.print_help()
+        sys.exit(0)
+    task = " ".join(args.task)
+    print(f"Task: {task}\n")
     try:
-        if args.mode in ("local", "mixed"):
-            local = create_provider("ollama", args.local_model)
-        if args.mode in ("remote", "mixed"):
-            remote = create_provider(args.remote_provider, args.remote_model)
-    except EnvironmentError as e:
-        print(f"\nConfiguration error: {e}\n")
+        answer = run_task(task, args, provider)
+        print(f"\nAnswer: {answer}\n")
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\nError: {e}\n")
         sys.exit(1)
 
-    print(f"\nMode: {_describe_mode(args, local, remote)}\n")
 
-    # --- Run ---
-    if args.interactive:
-        _repl(args, local, remote)
-    else:
-        if not args.task:
-            parser.print_help()
-            sys.exit(0)
-        task = " ".join(args.task)
-        print(f"Task: {task}\n")
-        try:
-            answer = run_task(task, args, local, remote)
-            print(f"\nAnswer: {answer}\n")
-        except KeyboardInterrupt:
-            print("\nInterrupted.")
-            sys.exit(0)
-        except Exception as e:
-            print(f"\nError: {e}\n")
-            sys.exit(1)
-
-
-def _repl(args, local: LLMProvider | None, remote: LLMProvider | None) -> None:
+def _repl(args, provider: LLMProvider) -> None:
     print("Interactive mode. Type your task and press Enter.")
     print("Commands: 'exit' or Ctrl+C to quit.\n")
 
@@ -190,7 +130,7 @@ def _repl(args, local: LLMProvider | None, remote: LLMProvider | None) -> None:
 
         print()
         try:
-            answer = run_task(task, args, local, remote)
+            answer = run_task(task, args, provider)
             print(f"\nAgent: {answer}\n")
         except Exception as e:
             print(f"Error: {e}\n")

@@ -1,6 +1,8 @@
 # Mini Agent
 
-A minimal AI agent built without any agent framework — just Python, the OpenAI SDK, and a `while` loop.
+A minimal AI agent built without any agent framework — just Python, the standard library, and a `while` loop.
+
+**This fork runs every LLM call on a Hailo-10H** (Raspberry Pi 5 + AI HAT+ 2) through [hailo-ollama](https://github.com/hailo-ai/hailo_model_zoo_genai), HailoRT 5.4.0+ (tested on 5.4.0). The cloud providers, plain Ollama, and mixed mode from upstream are removed.
 
 This project accompanies the Medium article series by [Sergey Neskoromny](https://www.linkedin.com/in/sergey-neskoromny/):
 
@@ -19,135 +21,92 @@ Follow me on [LinkedIn](https://lnkd.in/epTFAmQJ) and [Medium](https://sergey-ne
 
 ## What it does
 
-The agent takes a task, calls tools when needed, observes the results, and loops until it has a final answer. Three modes:
-
-| Mode | What happens |
-|------|--------------|
-| `local` | All LLM calls go to a local Ollama model — fully offline |
-| `remote` | All LLM calls go to a cloud provider (OpenAI, Anthropic, or Gemini) |
-| `mixed` | Local Ollama orchestrates the loop; it delegates complex subtasks to the remote model via `ask_remote()` |
+The agent takes a task, calls tools when needed, observes the results, and loops until it has a final answer. The model runs on the Hailo-10H NPU via hailo-ollama; the tools run locally in Python. No API keys, no cloud.
 
 ## Setup
 
+On the Raspberry Pi, install the [Hailo Model Zoo GenAI](https://github.com/hailo-ai/hailo_model_zoo_genai) package (HailoRT 5.4.0 or newer; 5.5.0 adds `qwen3:4b` and `gemma4:e2b`), then start the server and pull the model:
+
 ```bash
-git clone https://github.com/sergenes/mini_agent
-cd mini_agent
+hailo-ollama                                   # listens on 0.0.0.0:8000 (OLLAMA_HOST to change)
+curl http://localhost:8000/hailo/v1/list       # models your build supports
+curl http://localhost:8000/api/pull -H 'Content-Type: application/json'      -d '{"model": "qwen3:1.7b", "stream": true}'
+```
+
+Then the agent:
+
+```bash
+git clone https://github.com/tonyspanos/hailo_mini_agent
+cd hailo_mini_agent
 
 python -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
+source .venv/bin/activate      # Windows: .venv\Scriptsctivate
 
 pip install -r requirements.txt
-
-cp .env.example .env
-# edit .env and add your API keys
+cp .env.example .env           # only needed if hailo-ollama is not on localhost:8000
 ```
 
-For local/mixed mode, install [Ollama](https://ollama.com) and pull a model that supports function calling:
+| Env var | Default | Meaning |
+|---|---|---|
+| `HAILO_OLLAMA_HOST` | `http://localhost:8000` | Server address. Falls back to `OLLAMA_HOST` if unset. |
+| `HAILO_TOOL_MODE` | `native` | `native`: Ollama `tools` field on `/api/chat` (works on 5.4.0 with `qwen3:1.7b`). `prompt`: tools described in the system prompt, JSON reply parsed. |
 
-```bash
-ollama pull llama3.1       # good default
-ollama pull qwen2.5        # strong at tool use
-ollama pull mistral-nemo   # lighter alternative
-ollama serve
-```
+In `native` mode, if the server answers HTTP 400 "does not support tools" (e.g. `gemma4:e2b`), the provider switches to `prompt` mode by itself. `qwen3` replies may contain `<think>…</think>` blocks; the provider strips them.
+
+hailo-ollama handles one connection and one model at a time, so do not run two agents against the same device.
+
+---
+
+## Models
+
+| Model | Notes |
+|---|---|
+| `qwen3:1.7b` | **Default.** Fits the 4 GB and 8 GB Hailo-10H. Native tool calls verified on 5.4.0; it handles one tool per task well and may skip a second tool. |
+| `qwen3:4b` | Qwen3-4B-Instruct-2507, new in 5.5.0. 8 GB Hailo-10H only. |
+| `qwen2.5:1.5b`, `qwen2:1.5b`, `llama3.2:1b` | Older, smaller fallbacks (available on 5.4.0). |
+| `gemma4:e2b` | New in 5.5.0. No tool calling through hailo-ollama; the agent uses prompt mode. |
+
+Check the exact tags on your device with `curl http://localhost:8000/hailo/v1/list`.
 
 ---
 
 ## Usage
 
-### Local (Ollama only)
-
 ```bash
-python agent.py --mode local "What is 15% of 847?"
-python agent.py --mode local --local-model qwen2.5 "What's the weather in Tokyo and today's date?"
+python agent.py "What is 15% of 847?"
+python agent.py --model qwen3:4b "What's the weather in Tokyo and today's date?"
+python agent.py --interactive
+python agent.py --quiet "What is 144 * 37?"
 ```
 
-### Remote (cloud provider)
+### With model fallback
+
+Try models in order; skip a model that errors or prints tool calls as text:
 
 ```bash
-# OpenAI
-python agent.py --mode remote --provider openai "Explain how ReAct agents work"
-python agent.py --mode remote --provider openai --model gpt-4o "Write a detailed explanation of MCP"
-
-# Anthropic
-python agent.py --mode remote --provider anthropic "Write a haiku about Python"
-python agent.py --mode remote --provider anthropic --model claude-sonnet-4-6 "..."
-
-# Google Gemini
-python agent.py --mode remote --provider gemini "Summarize the ReAct paper"
-python agent.py --mode remote --provider gemini --model gemini-2.0-flash-lite "..."
+python agent.py --fallback qwen3:4b qwen2.5:1.5b "What is 15% of 847?"
 ```
 
-### Mixed (local orchestrates, remote handles complex reasoning)
+Each attempt uses the full reliability stack from `reliability.py`.
 
-```bash
-python agent.py --mode mixed "What's today's date, and explain quantum entanglement in simple terms"
-python agent.py --mode mixed --local-model qwen2.5 --provider anthropic "..."
+### Resilience test (LLM retry)
+
+Start a task, then stop `hailo-ollama` while you see `Thinking…`:
+
+```
+WARNING  LLM call attempt 1 failed (Cannot reach hailo-ollama …) — retrying in 2.1s
+WARNING  LLM call attempt 2 failed (Cannot reach hailo-ollama …) — retrying in 4.3s
 ```
 
-In mixed mode the local model decides what to handle itself and when to call `ask_remote()`.
-Simple tool calls (calculate, get_date) stay local. Knowledge-heavy tasks go to the cloud.
-
-### Interactive REPL
-
-```bash
-python agent.py --mode local --interactive
-python agent.py --mode mixed --interactive
-```
-
-### With provider fallback (local mode)
-
-Try providers in order; skip models that don't support structured tool calling:
-
-```bash
-python agent.py --mode local --fallback llama3.1 mistral-nemo "What is 15% of 847?"
-```
-
-If `qwen2.5` (the default) fails or outputs text-based tool invocations, the agent retries with `llama3.1`, then `mistral-nemo`. Each attempt uses the full reliability stack from `reliability.py`.
-
-### Network resilience test (LLM retry)
-
-This demonstrates the reliability layer surviving a real network interruption:
-
-```bash
-python agent.py --mode remote --provider openai \
-    "Get today's date and the weather in Tokyo."
-```
-
-1. Run the command. When you see `Thinking…`, turn off Wi-Fi or disconnect ethernet.
-2. The agent retries the LLM call with exponential backoff:
-   ```
-   WARNING  LLM call attempt 1 failed (Connection error) — retrying in 2.1s
-   WARNING  LLM call attempt 2 failed (Connection error) — retrying in 4.3s
-   ```
-3. Turn Wi-Fi back on. The next attempt succeeds and the agent finishes normally.
-
-The retry is in `_RetryingProvider` inside `reliability.py` — it wraps the provider's `complete()` call so the agent loop never sees the transient failure. Up to 5 attempts, base delay 2 s, doubles each retry.
-
-### Quiet mode (suppress tool trace)
-
-```bash
-python agent.py --mode remote --quiet "What is 144 * 37?"
-```
+Restart it and the next attempt succeeds. The retry is `_RetryingProvider` in `reliability.py`: up to 5 attempts, base delay 2 s, doubling each retry.
 
 ### Multi-step example
 
 ```bash
-python agent.py --mode remote --provider openai "Get today's date and the weather in Tokyo. Calculate how many days are left until New Year's Day 2027. Write a short daily briefing with all three facts to briefing.txt, then read it back and count how many words it has."
+python agent.py --model qwen3:4b "Get today's date and the weather in Tokyo. Calculate how many days are left until New Year's Day 2027. Write a short daily briefing with all three facts to briefing.txt, then read it back and count how many words it has."
 ```
 
-This triggers six tool calls in sequence: `get_current_date` → `get_weather` → `calculate` → `write_file` → `read_file` → `count_words`.
-
----
-
-## Default models
-
-| Provider | Default model |
-|----------|---------------|
-| openai | `gpt-4o-mini` |
-| anthropic | `claude-haiku-4-5-20251001` |
-| gemini | `gemini-2.0-flash` |
-| ollama | `qwen2.5` |
+This should trigger `get_current_date` → `get_weather` → `calculate` → `write_file` → `read_file` → `count_words`. Small models may skip steps; `qwen3:4b` follows long chains better than `qwen3:1.7b`.
 
 ---
 
@@ -155,10 +114,10 @@ This triggers six tool calls in sequence: `get_current_date` → `get_weather` �
 
 ```
 mini_agent/
-├── agent.py              # CLI entry point — argument parsing, REPL, mode dispatch
-├── core.py               # The agent loop: run_agent() and run_agent_mixed()
+├── agent.py              # CLI entry point — argument parsing, REPL
+├── core.py               # The agent loop: run_agent()
 ├── reliability.py        # Reliability layer: retry, circuit breaker, validation, tracing, provider fallback
-├── providers.py          # LLM provider abstraction (OpenAI, Anthropic, Gemini, Ollama)
+├── providers.py          # hailo-ollama provider (stdlib HTTP, native or prompt tool calling)
 ├── tools.py              # Tool implementations and schemas
 ├── ui.py                 # Spinner — thread-safe braille activity indicator
 ├── mcp_server.py         # Demo MCP server (to_uppercase, count_words)
@@ -217,8 +176,6 @@ The `web_search` and `get_weather` tools are stubs. Replace them with real API c
 └─────────────────────────────────────────┘
 ```
 
-In mixed mode, `ask_remote()` is an extra tool the local model can call. Calling it triggers a fresh `run_agent()` with the remote provider.
-
 ---
 
 ## MCP tools
@@ -248,13 +205,18 @@ Each tool call spawns a fresh subprocess, performs the `initialize` → `call_to
 ## Notes
 
 - `calculate()` uses Python's `eval()` with empty builtins — safe enough for a demo, not for production. Replace with a proper math library (`sympy`, `asteval`) for real use.
-- Ollama function calling works with `llama3.1`, `llama3.2`, `qwen2.5`, `mistral-nemo`. Models like `phi3` or `deepseek-r1` may not support it reliably.
-- Gemini uses its OpenAI-compatible endpoint — no `google-generativeai` SDK needed.
-- The `anthropic` SDK is only needed if you use `--provider anthropic`.
+- `visual-testing/` and `deployment-pipeline/` are unchanged from upstream and still use their own cloud / Ollama clients (see their READMEs).
 
 ---
 
 ## Changelog
+
+### hailo fork — hailo-ollama only
+
+- `providers.py` is a single `HailoOllamaProvider` on `/api/chat` (stdlib `urllib`, no SDK).
+- Native tool calling (HailoRT 5.5.0+), prompt-based fallback, `<think>` stripping.
+- Default model `qwen3:1.7b`; `qwen3:4b` for 8 GB devices.
+- Removed OpenAI, Anthropic, Gemini, plain Ollama, `--mode remote/mixed`, and `ask_remote()`.
 
 ### v0.5 — Deployment pipeline
 
